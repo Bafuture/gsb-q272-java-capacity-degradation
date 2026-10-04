@@ -19,6 +19,53 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 272）。
 ./mvnw -q verify
 ```
 
+## 组件说明
+
+核心类位于 `com.example.gsb.capacity`：
+
+| 类 | 职责 |
+|----|------|
+| `CapacityGuard` | 核心组件：容量预留、水位评估、降级/恢复、事件与统计 |
+| `WaterLevel` | 四级水位：`NORMAL` / `WARNING` / `READ_ONLY` / `CRITICAL` |
+| `WaterLevelThresholds` | 阈值配置（字节数或容量比例），含滞回带 `hysteresis` |
+| `WriteResult` | 写入结果：接受/拒绝 + 当前水位 + 拒绝原因，绝不静默丢弃 |
+| `CleanupCallback` | 危险水位清理回调，返回释放字节数 |
+| `WaterLevelListener` / `WaterLevelChangeEvent` | 水位变化事件通知 |
+| `CapacityStats` | 统计快照：各水位持续时间、拒绝次数、回收触发次数、当前用量 |
+
+### 关键设计
+
+- **只读降级**：用量达到 `readOnly` 阈值后，`tryWrite` 一律拒绝并返回
+  当前水位与原因；即使未到只读水位，单次写入会越过 `critical` 阈值也会被
+  原子拒绝，保证任何情况下不突破危险水位。
+- **抖动抑制（滞回 hysteresis）**：升档立即生效（用量 ≥ 阈值）；降档要求
+  用量跌破「阈值 − hysteresisBytes」才回落。用量在阈值附近小幅波动时水位
+  保持不变，避免只读状态频繁切换导致写入方反复成败交替。
+- **危险水位清理**：每次进入 `CRITICAL` 触发一次清理回调（锁外执行），
+  回调返回的释放字节数会重新评估水位；回调抛异常只记录日志，不影响
+  降级状态。
+- **并发安全**：容量预留与水位判断在同一把锁内原子完成，多线程并发写入
+  不会超卖；监听器通知与清理回调均在锁外执行，慢监听器不阻塞写入路径。
+- **事件与统计**：水位变化通知所有监听器，单个监听器异常被捕获、不影响
+  主流程与其他监听器；统计含各水位累计持续时间（可注入 `Ticker` 便于
+  测试）、拒绝写入次数、回收触发次数与当前使用量。
+
+### 快速示例
+
+```java
+WaterLevelThresholds thresholds =
+        WaterLevelThresholds.ofFractions(capacityBytes, 0.7, 0.85, 0.95, 0.05);
+CapacityGuard guard = new CapacityGuard(thresholds);
+guard.setCleanupCallback(() -> evictExpiredData());
+guard.addListener(event -> log.info("water level {} -> {}", event.from(), event.to()));
+
+WriteResult result = guard.tryWrite(recordBytes);
+if (!result.isAccepted()) {
+    // result.level() 当前水位，result.reason() 拒绝原因
+    return rejected(result.level(), result.reason().orElse("unknown"));
+}
+```
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
