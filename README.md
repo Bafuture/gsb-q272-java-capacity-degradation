@@ -30,3 +30,48 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 272）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+## 组件说明：存储容量水位与只读降级
+
+包：`com.example.gsb.capacity`
+
+### 核心类型
+
+| 类型 | 职责 |
+|------|------|
+| `WaterLevel` | 四级水位：`NORMAL` / `WARNING` / `READ_ONLY` / `CRITICAL` |
+| `CapacityConfig` | 各级阈值（占容量比例，可配）与滞回区间 `hysteresisFraction` |
+| `CapacityGuard` | 水位状态机：`write / tryWrite / free`、回调注册、监听器注册、`stats()` |
+| `StorageDegradedException` | 写入被拒绝时抛出，携带当前水位、原因、已用量与总容量 |
+| `ReclaimCallback` | 进入危险水位时触发的清理回调（如清理过期数据） |
+| `WaterLevelListener` / `WaterLevelChangeEvent` | 水位迁移事件通知 |
+| `CapacityStats` | 各水位累计停留时长、拒绝写入次数、回收触发/失败次数、当前使用量 |
+
+### 用法示例
+
+```java
+CapacityGuard guard = new CapacityGuard(
+        new CapacityConfig(1_000_000L, 0.70, 0.85, 0.95, 0.05));
+
+guard.addListener(event -> System.out.println(event.previous() + " -> " + event.current()));
+guard.addReclaimCallback(g -> g.free(deleteExpiredFiles())); // 回调中释放容量
+
+try {
+    guard.write(1024);
+} catch (StorageDegradedException e) {
+    // 明确拒绝：e.level() / e.getMessage() 给出当前水位与原因，绝不静默丢弃
+}
+CapacityStats stats = guard.stats();
+```
+
+### 设计要点
+
+- **只读拒绝**：`READ_ONLY` 及以上等级，`write` 必抛 `StorageDegradedException`（含水位+原因+用量），`rejectedWrites` 计数；另有 `tryWrite` 返回布尔。
+- **硬上限保证**：写入通过 CAS 预留容量，提交前校验“当前用量 + 本次写入 ≤ 危险阈值”，即使状态机视图滞后也**绝不突破危险水位**（并发测试 32 线程×2000 次写入证明）。
+- **抖动抑制（滞回恢复 / hysteresis）**：水位**上升立即生效**；**下降必须跌破“当前等级阈值 − 滞回区间”才恢复**。例如只读阈值 85%、滞回 5% 时，用量从 85% 降到 81% 仍保持只读，直到 ≤ 80% 才恢复可写，避免用量在阈值附近抖动时可写/只读频繁翻转。
+- **自动恢复**：`free`（含清理回调内释放）后自动重估水位，平滑回到 `WARNING/NORMAL`。
+- **回调与监听器隔离**：清理回调仅在“进入危险水位”这一迁移时触发一次，与监听器均在状态锁之外执行，任何异常被捕获（回调失败计入 `reclaimFailures`），不影响降级状态机与主流程。
+
+### 测试覆盖
+
+`./mvnw -q verify`，共 22 个用例：水位迁移与事件顺序、只读拒绝（携带水位/原因）、清理回调（触发/失败隔离/自动恢复）、回落恢复与滞回抖动抑制（含无滞回对照组）、32 线程并发不越界、统计时长/计数。
